@@ -1,0 +1,6 @@
+aws_region   = "us-east-2"
+project_name = "hardened-k8s"
+environment  = "dev"
+
+# Replace with a globally unique value before applying.
+bucket_suffix = "12345678"
