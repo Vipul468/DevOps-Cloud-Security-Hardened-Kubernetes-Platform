@@ -1,7 +1,7 @@
 variable "aws_region" {
   description = "AWS region"
   type        = string
-  default     = "us-east-2"
+  default     = "us-east-1"
 }
 
 variable "project_name" {
@@ -14,10 +14,4 @@ variable "environment" {
   description = "Environment name"
   type        = string
   default     = "dev"
-}
-
-variable "bucket_suffix" {
-  description = "Unique suffix for the S3 bucket name"
-  type        = string
-  sensitive   = false
 }

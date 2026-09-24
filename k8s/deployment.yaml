@@ -3,51 +3,71 @@ kind: Deployment
 metadata:
   name: hardened-app
   namespace: hardened-app
+
 spec:
   replicas: 2
+
   selector:
     matchLabels:
       app: hardened-app
+
   template:
     metadata:
       labels:
         app: hardened-app
+
     spec:
-      automountServiceAccountToken: false
+      # Use the RBAC ServiceAccount
+      serviceAccountName: hardened-app
+      automountServiceAccountToken: true
+
       securityContext:
         seccompProfile:
           type: RuntimeDefault
+
       containers:
         - name: app
           image: hardened-k8s-app:local
-          imagePullPolicy: IfNotPresent
+          imagePullPolicy: Always
+
           ports:
             - containerPort: 5000
+
           envFrom:
             - configMapRef:
                 name: hardened-app-config
+
           securityContext:
             allowPrivilegeEscalation: false
+
             capabilities:
-              drop: ["ALL"]
+              drop:
+                - ALL
+
             readOnlyRootFilesystem: true
             runAsNonRoot: true
+
           resources:
             requests:
               cpu: 100m
               memory: 128Mi
+
             limits:
               cpu: 500m
               memory: 256Mi
+
           readinessProbe:
             httpGet:
               path: /ready
               port: 5000
+
             initialDelaySeconds: 3
             periodSeconds: 5
+
           livenessProbe:
             httpGet:
               path: /health
               port: 5000
+
             initialDelaySeconds: 10
             periodSeconds: 10
