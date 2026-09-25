@@ -1,39 +1,65 @@
-# DevOps Cloud Security-Hardened Kubernetes Platform
+# DevOps & Cloud Engineer | Security Hardened Kubernetes Platform
 
-A beginner-friendly DevOps project demonstrating a security-hardened Flask application on Kubernetes.
+A security-hardened DevOps and Kubernetes project deployed on AWS using Terraform, Docker, Amazon ECR, Amazon EKS, GitHub Actions, Trivy, IAM, ALB/Ingress, Prometheus and Grafana.
 
-## Components
-- Python Flask application
-- Docker container
-- Kubernetes Namespace, ConfigMap, Deployment, Service, Ingress
-- RBAC and NetworkPolicy
-- Terraform project structure for infrastructure automation
-- GitHub Actions CI
-- Local deployment scripts
+## Project Objective
 
-## Project goal
-Build and understand the platform from scratch. Start locally with Docker/Kubernetes, then add Terraform and cloud deployment.
+The objective of this project is to build an end-to-end DevSecOps deployment workflow where application code moves from development to GitHub, passes CI/CD and security scanning, is containerized and stored in Amazon ECR, and is finally deployed on a security-hardened Amazon EKS cluster with monitoring.
 
-## Local quick start
-```bash
-cd app
-pip install -r requirements.txt
-python app.py
-```
+---
 
-Run tests:
-```bash
-pytest
-```
+# Architecture
 
-Build Docker image:
-```bash
-docker build -t hardened-k8s-app:local -f docker/Dockerfile .
-```
-
-Deploy to a local Kubernetes cluster:
-```bash
-bash scripts/deploy-local.sh
-```
-
-> The Terraform files are intentionally a starting scaffold. Cloud-specific resources should be added after the local Kubernetes lab is working.
+```text
+Developer
+    |
+    | 1. Write Application Code
+    v
+GitHub Repository
+    |
+    | 2. Git Push
+    v
+GitHub Actions
+    |
+    +---- Build & Test
+    |
+    +---- Trivy Security Scan
+    |
+    v
+Terraform
+    |
+    +---- IAM
+    +---- VPC / Networking
+    +---- EKS
+    +---- Worker Nodes
+    |
+    v
+Docker Image
+    |
+    v
+Amazon ECR
+    |
+    v
+Amazon EKS
+    |
+    +---- Kubernetes Deployment
+    +---- Service
+    +---- RBAC
+    +---- NetworkPolicy
+    |
+    v
+AWS Application Load Balancer / Ingress
+    |
+    v
+Application
+    |
+    +-------------------+
+    |                   |
+    v                   v
+Prometheus           Grafana
+    |                   |
+    +---------+---------+
+              |
+              v
+       CPU / Memory
+       Monitoring
