@@ -2,59 +2,59 @@
 import json
 import os
 import ssl
+import time
 import urllib.request
 import urllib.error
 import urllib.parse
 
 app = Flask(__name__)
 
-# =========================================================
+# ============================================================
 # CONFIGURATION
-# =========================================================
+# ============================================================
 
-NAMESPACE = "hardened-app"
+NAMESPACE = os.getenv("NAMESPACE", "hardened-app")
 
-KUBERNETES_API = "https://kubernetes.default.svc"
+KUBERNETES_API = os.getenv(
+    "KUBERNETES_API",
+    "https://kubernetes.default.svc"
+)
 
-SERVICE_ACCOUNT_TOKEN = (
+PROMETHEUS_URL = os.getenv(
+    "PROMETHEUS_URL",
+    "http://monitoring-kube-prometheus-prometheus.monitoring.svc.cluster.local:9090"
+)
+
+GRAFANA_URL = os.getenv(
+    "GRAFANA_URL",
+    "http://monitoring-grafana.monitoring.svc.cluster.local:80"
+)
+
+SERVICE_ACCOUNT_TOKEN_PATH = (
     "/var/run/secrets/kubernetes.io/serviceaccount/token"
 )
 
-SERVICE_ACCOUNT_CA = (
+SERVICE_ACCOUNT_CA_PATH = (
     "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
 )
 
-PROMETHEUS_URL = (
-    "http://monitoring-kube-prometheus-prometheus."
-    "monitoring.svc.cluster.local:9090"
-)
 
-GRAFANA_URL = (
-    "http://monitoring-grafana."
-    "monitoring.svc.cluster.local"
-)
-
-
-# =========================================================
+# ============================================================
 # KUBERNETES AUTHENTICATION
-# =========================================================
+# ============================================================
 
 def get_kubernetes_token():
 
     try:
 
         with open(
-            SERVICE_ACCOUNT_TOKEN,
+            SERVICE_ACCOUNT_TOKEN_PATH,
             "r"
-        ) as file:
+        ) as f:
 
-            token = file.read().strip()
+            return f.read().strip()
 
-            return token if token else None
-
-    except Exception as e:
-
-        print("ServiceAccount token error:", e)
+    except Exception:
 
         return None
 
@@ -63,22 +63,14 @@ def get_kubernetes_ssl_context():
 
     try:
 
-        if os.path.exists(SERVICE_ACCOUNT_CA):
+        return ssl.create_default_context(
+            cafile=SERVICE_ACCOUNT_CA_PATH
+        )
 
-            return ssl.create_default_context(
-                cafile=SERVICE_ACCOUNT_CA
-            )
+    except Exception:
 
-    except Exception as e:
+        return ssl.create_default_context()
 
-        print("Kubernetes CA error:", e)
-
-    return None
-
-
-# =========================================================
-# KUBERNETES API REQUEST
-# =========================================================
 
 def kubernetes_request(path):
 
@@ -86,243 +78,226 @@ def kubernetes_request(path):
 
     if not token:
 
-        print("Kubernetes token not available")
-
-        return None
+        raise RuntimeError(
+            "Kubernetes service account token not found"
+        )
 
     url = KUBERNETES_API + path
 
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Accept": "application/json"
-    }
+    request = urllib.request.Request(
+        url,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/json",
+        },
+        method="GET",
+    )
 
-    try:
+    context = get_kubernetes_ssl_context()
 
-        request = urllib.request.Request(
-            url,
-            headers=headers
+    with urllib.request.urlopen(
+        request,
+        context=context,
+        timeout=5
+    ) as response:
+
+        return json.loads(
+            response.read().decode("utf-8")
         )
 
-        ssl_context = get_kubernetes_ssl_context()
 
-        if not ssl_context:
-
-            print(
-                "Kubernetes CA certificate not available"
-            )
-
-            return None
-
-        with urllib.request.urlopen(
-            request,
-            timeout=5,
-            context=ssl_context
-        ) as response:
-
-            return json.loads(
-                response.read().decode("utf-8")
-            )
-
-    except urllib.error.HTTPError as e:
-
-        print(
-            "Kubernetes API HTTP error:",
-            e.code,
-            e.reason
-        )
-
-        return None
-
-    except Exception as e:
-
-        print(
-            "Kubernetes API error:",
-            e
-        )
-
-        return None
-
-
-# =========================================================
-# POD STATUS
-# =========================================================
+# ============================================================
+# KUBERNETES POD STATUS
+# ============================================================
 
 def get_pod_status():
 
-    data = kubernetes_request(
-        f"/api/v1/namespaces/{NAMESPACE}/pods"
-    )
-
-    if not data:
-
-        return {
-            "running": 0,
-            "total": 0
-        }
-
-    items = data.get(
-        "items",
-        []
-    )
-
-    running = 0
-
-    for pod in items:
-
-        phase = (
-            pod
-            .get("status", {})
-            .get("phase")
-        )
-
-        if phase == "Running":
-
-            running += 1
-
-    return {
-        "running": running,
-        "total": len(items)
-    }
-
-
-# =========================================================
-# NODE STATUS
-# =========================================================
-
-def get_node_status():
-
-    data = kubernetes_request(
-        "/api/v1/nodes"
-    )
-
-    if not data:
-
-        return {
-            "ready": 0,
-            "total": 0
-        }
-
-    items = data.get(
-        "items",
-        []
-    )
-
-    ready = 0
-
-    for node in items:
-
-        conditions = (
-            node
-            .get("status", {})
-            .get("conditions", [])
-        )
-
-        for condition in conditions:
-
-            if (
-                condition.get("type") == "Ready"
-                and condition.get("status") == "True"
-            ):
-
-                ready += 1
-
-                break
-
-    return {
-        "ready": ready,
-        "total": len(items)
-    }
-
-
-# =========================================================
-# GENERIC HTTP GET
-# =========================================================
-
-def http_get(
-    url,
-    headers=None,
-    timeout=5
-):
-
     try:
 
-        request = urllib.request.Request(
-            url,
-            headers=headers or {}
+        # Only count hardened application pods.
+        # cpu-load is intentionally excluded.
+        data = kubernetes_request(
+            f"/api/v1/namespaces/{NAMESPACE}/pods"
         )
 
-        with urllib.request.urlopen(
-            request,
-            timeout=timeout
-        ) as response:
+        pods = data.get("items", [])
 
-            return {
-                "status": response.status,
-                "data": response.read().decode(
-                    "utf-8"
-                )
-            }
+        app_pods = []
+
+        for pod in pods:
+
+            labels = (
+                pod.get("metadata", {})
+                .get("labels", {})
+            )
+
+            # Application deployment pods use app=hardened-app.
+            if labels.get("app") == "hardened-app":
+
+                app_pods.append(pod)
+
+        total = len(app_pods)
+
+        running = sum(
+            1
+            for pod in app_pods
+            if pod.get("status", {}).get("phase") == "Running"
+        )
+
+        return {
+            "running": running,
+            "total": total,
+            "status": (
+                "Healthy"
+                if running == total and total > 0
+                else "Warning"
+            )
+        }
 
     except Exception as e:
 
+        print(
+            "Pod status error:",
+            e
+        )
+
         return {
-            "status": 0,
-            "error": str(e)
+            "running": 0,
+            "total": 0,
+            "status": "Offline"
         }
 
 
-# =========================================================
-# PROMETHEUS
-# =========================================================
+# ============================================================
+# KUBERNETES NODE STATUS
+# ============================================================
+
+def get_node_status():
+
+    try:
+
+        data = kubernetes_request(
+            "/api/v1/nodes"
+        )
+
+        nodes = data.get(
+            "items",
+            []
+        )
+
+        total = len(nodes)
+
+        ready = 0
+
+        for node in nodes:
+
+            conditions = (
+                node.get("status", {})
+                .get("conditions", [])
+            )
+
+            for condition in conditions:
+
+                if (
+                    condition.get("type") == "Ready"
+                    and condition.get("status") == "True"
+                ):
+
+                    ready += 1
+
+                    break
+
+        return {
+            "ready": ready,
+            "total": total,
+            "status": (
+                "Healthy"
+                if ready == total and total > 0
+                else "Warning"
+            )
+        }
+
+    except Exception as e:
+
+        print(
+            "Node status error:",
+            e
+        )
+
+        return {
+            "ready": 0,
+            "total": 0,
+            "status": "Offline"
+        }
+
+
+# ============================================================
+# GENERIC HTTP GET
+# ============================================================
+
+def http_get(url):
+
+    request = urllib.request.Request(
+        url,
+        headers={
+            "Accept": "application/json"
+        },
+        method="GET"
+    )
+
+    with urllib.request.urlopen(
+        request,
+        timeout=5
+    ) as response:
+
+        return response.read().decode("utf-8")
+
+
+# ============================================================
+# PROMETHEUS INSTANT QUERY
+# ============================================================
 
 def prometheus_query(query):
 
     try:
 
-        encoded_query = urllib.parse.quote(
-            query
-        )
+        encoded_query = urllib.parse.urlencode({
+            "query": query
+        })
 
         url = (
             PROMETHEUS_URL
-            + "/api/v1/query?query="
+            + "/api/v1/query?"
             + encoded_query
         )
 
-        result = http_get(url)
+        raw = http_get(url)
 
-        if result.get("status") != 200:
-
-            return None
-
-        data = json.loads(
-            result.get(
-                "data",
-                "{}"
-            )
-        )
+        data = json.loads(raw)
 
         if data.get("status") != "success":
 
-            return None
+            return 0.0
 
-        results = (
-            data
-            .get("data", {})
+        result = (
+            data.get("data", {})
             .get("result", [])
         )
 
-        if not results:
+        if not result:
 
-            return None
+            return 0.0
 
-        value = results[0].get(
+        value = result[0].get(
             "value",
-            [None, "0"]
-        )[1]
+            []
+        )
 
-        return float(value)
+        if len(value) < 2:
+
+            return 0.0
+
+        return float(value[1])
 
     except Exception as e:
 
@@ -331,36 +306,301 @@ def prometheus_query(query):
             e
         )
 
-        return None
+        return 0.0
 
 
-def check_prometheus():
+# ============================================================
+# PROMETHEUS RANGE QUERY
+# ============================================================
 
-    result = http_get(
-        PROMETHEUS_URL
-        + "/-/healthy"
+def prometheus_range_query(
+    query,
+    minutes=10,
+    step=10
+):
+
+    try:
+
+        end = int(
+            time.time()
+        )
+
+        start = (
+            end -
+            (minutes * 60)
+        )
+
+        params = urllib.parse.urlencode({
+            "query": query,
+            "start": start,
+            "end": end,
+            "step": step
+        })
+
+        url = (
+            PROMETHEUS_URL
+            + "/api/v1/query_range?"
+            + params
+        )
+
+        raw = http_get(url)
+
+        data = json.loads(raw)
+
+        if data.get("status") != "success":
+
+            return []
+
+        results = (
+            data.get("data", {})
+            .get("result", [])
+        )
+
+        if not results:
+
+            return []
+
+        values = (
+            results[0]
+            .get("values", [])
+        )
+
+        history = []
+
+        for item in values:
+
+            if len(item) < 2:
+
+                continue
+
+            try:
+
+                value = float(
+                    item[1]
+                )
+
+                if value != value:
+
+                    continue
+
+                value = max(
+                    0.0,
+                    min(
+                        100.0,
+                        value
+                    )
+                )
+
+                history.append(
+                    round(
+                        value,
+                        2
+                    )
+                )
+
+            except Exception:
+
+                continue
+
+        return history
+
+    except Exception as e:
+
+        print(
+            "Prometheus range query error:",
+            e
+        )
+
+        return []
+
+
+# ============================================================
+# CPU USAGE
+# ============================================================
+
+def get_cpu_usage():
+
+    query = """
+    100 * (
+        1 -
+        avg(
+            rate(
+                node_cpu_seconds_total{
+                    mode="idle"
+                }[1m]
+            )
+        )
+    )
+    """
+
+    value = prometheus_query(
+        query
     )
 
-    return result.get("status") == 200
-
-
-# =========================================================
-# GRAFANA
-# =========================================================
-
-def check_grafana():
-
-    result = http_get(
-        GRAFANA_URL
-        + "/api/health"
+    return round(
+        max(
+            0.0,
+            min(
+                100.0,
+                value
+            )
+        ),
+        2
     )
 
-    return result.get("status") == 200
+
+# ============================================================
+# CPU HISTORICAL DATA
+# ============================================================
+
+def get_cpu_history():
+
+    query = """
+    100 * (
+        1 -
+        avg(
+            rate(
+                node_cpu_seconds_total{
+                    mode="idle"
+                }[1m]
+            )
+        )
+    )
+    """
+
+    return prometheus_range_query(
+        query,
+        minutes=10,
+        step=10
+    )
 
 
-# =========================================================
+# ============================================================
+# MEMORY USAGE
+# ============================================================
+
+def get_memory_usage():
+
+    query = """
+    100 * (
+        1 -
+        (
+            sum(node_memory_MemAvailable_bytes)
+            /
+            sum(node_memory_MemTotal_bytes)
+        )
+    )
+    """
+
+    value = prometheus_query(
+        query
+    )
+
+    return round(
+        max(
+            0.0,
+            min(
+                100.0,
+                value
+            )
+        ),
+        2
+    )
+
+
+# ============================================================
+# MEMORY HISTORICAL DATA
+# ============================================================
+
+def get_memory_history():
+
+    query = """
+    100 * (
+        1 -
+        (
+            sum(node_memory_MemAvailable_bytes)
+            /
+            sum(node_memory_MemTotal_bytes)
+        )
+    )
+    """
+
+    return prometheus_range_query(
+        query,
+        minutes=10,
+        step=10
+    )
+
+
+# ============================================================
+# PROMETHEUS HEALTH
+# ============================================================
+
+def get_prometheus_health():
+
+    try:
+
+        response = http_get(
+            PROMETHEUS_URL
+            + "/-/healthy"
+        )
+
+        if response:
+
+            return "Healthy"
+
+    except Exception as e:
+
+        print(
+            "Prometheus health error:",
+            e
+        )
+
+    return "Offline"
+
+
+# ============================================================
+# GRAFANA HEALTH
+# ============================================================
+
+def get_grafana_health():
+
+    try:
+
+        raw = http_get(
+            GRAFANA_URL
+            + "/api/health"
+        )
+
+        data = json.loads(
+            raw
+        )
+
+        if data.get(
+            "database"
+        ) == "ok":
+
+            return "Healthy"
+
+        if data.get(
+            "status"
+        ) == "ok":
+
+            return "Healthy"
+
+    except Exception as e:
+
+        print(
+            "Grafana health error:",
+            e
+        )
+
+    return "Offline"
+
+
+# ============================================================
 # MONITORING DATA
-# =========================================================
+# ============================================================
 
 def get_monitoring_data():
 
@@ -368,115 +608,80 @@ def get_monitoring_data():
 
     nodes = get_node_status()
 
-    prometheus = check_prometheus()
+    prometheus = (
+        get_prometheus_health()
+    )
 
-    grafana = check_grafana()
+    grafana = (
+        get_grafana_health()
+    )
 
-    cpu = 0
+    cpu = get_cpu_usage()
 
-    memory = 0
+    memory = get_memory_usage()
 
-    if prometheus:
+    cpu_history = (
+        get_cpu_history()
+    )
 
-        cpu_query = """
-        100 * (
-            1 -
-            avg(
-                rate(
-                    node_cpu_seconds_total{
-                        mode="idle"
-                    }[5m]
-                )
-            )
+    memory_history = (
+        get_memory_history()
+    )
+
+    monitoring_status = (
+        "Healthy"
+        if (
+            prometheus == "Healthy"
+            and
+            grafana == "Healthy"
         )
-        """
-
-        memory_query = """
-        100 * (
-            1 -
-            (
-                sum(node_memory_MemAvailable_bytes)
-                /
-                sum(node_memory_MemTotal_bytes)
-            )
-        )
-        """
-
-        cpu_value = prometheus_query(
-            cpu_query
-        )
-
-        memory_value = prometheus_query(
-            memory_query
-        )
-
-        if cpu_value is not None:
-
-            cpu = round(
-                max(
-                    0,
-                    min(
-                        100,
-                        cpu_value
-                    )
-                ),
-                2
-            )
-
-        if memory_value is not None:
-
-            memory = round(
-                max(
-                    0,
-                    min(
-                        100,
-                        memory_value
-                    )
-                ),
-                2
-            )
+        else "Offline"
+    )
 
     return {
-        "cpu": cpu,
 
-        "memory": memory,
+        "namespace": NAMESPACE,
 
         "pods": pods,
 
         "nodes": nodes,
 
-        "monitoring": {
-            "active": (
-                prometheus
-                or grafana
-            ),
+        "prometheus": prometheus,
 
-            "prometheus": prometheus,
+        "grafana": grafana,
 
-            "grafana": grafana
-        }
+        "monitoring": monitoring_status,
+
+        "cpu": cpu,
+
+        "memory": memory,
+
+        "cpu_history": cpu_history,
+
+        "memory_history": memory_history,
+
     }
 
 
-# =========================================================
-# HEALTH API
-# =========================================================
+# ============================================================
+# HEALTH ROUTES
+# ============================================================
 
 @app.route("/health")
 def health():
 
     return jsonify({
-
-        "status": "healthy",
-
-        "service":
-            "security-hardened-k8s-platform"
+        "status": "healthy"
     })
 
 
-# =========================================================
-# MONITORING API
-# =========================================================
+@app.route("/ready")
+def ready():
+
+    return jsonify({
+        "status": "ready"
+    })
+
 
 @app.route("/monitoring-data")
 def monitoring_data():
@@ -486,28 +691,29 @@ def monitoring_data():
     )
 
 
-# =========================================================
-# DASHBOARD
-# =========================================================
+# ============================================================
+# DASHBOARD UI
+# ============================================================
 
 @app.route("/")
 def dashboard():
 
-    return render_template_string(
-r'''
+    return render_template_string("""
 <!DOCTYPE html>
 
-<html>
+<html lang="en">
 
 <head>
 
 <meta charset="UTF-8">
 
-<meta name="viewport"
-      content="width=device-width, initial-scale=1.0">
+<meta
+    name="viewport"
+    content="width=device-width, initial-scale=1.0"
+>
 
 <title>
-Security Hardened Kubernetes Platform
+Security Hardened K8s Platform
 </title>
 
 <style>
@@ -522,63 +728,82 @@ body {
 
     background: #0f172a;
 
-    color: #e2e8f0;
+    color: #e5e7eb;
 
     font-family:
+        Inter,
         Arial,
         Helvetica,
         sans-serif;
 
-    font-size: 13px;
+    min-height: 100vh;
 }
 
 .container {
 
-    max-width: 1100px;
+    width: 100%;
 
-    margin: auto;
+    max-width: 1110px;
 
-    padding: 18px;
+    margin: 0 auto;
+
+    padding: 28px 20px 20px;
 }
+
+
+/* =========================================================
+   HEADER
+   ========================================================= */
 
 .header {
 
     background: #111827;
 
-    border: 1px solid #334155;
+    border: 1px solid #293548;
 
     border-radius: 10px;
 
-    padding: 17px;
+    padding: 20px 18px;
 
     margin-bottom: 16px;
+
+    box-shadow:
+        0 8px 25px rgba(0,0,0,0.12);
 }
 
 .header h1 {
 
-    margin: 0 0 6px 0;
+    margin: 0;
 
-    font-size: 21px;
+    font-size: 24px;
+
+    font-weight: 800;
+
+    letter-spacing: -0.5px;
 }
 
-.header p {
+.subtitle {
 
-    margin: 0;
+    margin-top: 5px;
 
     color: #94a3b8;
 
-    font-size: 12px;
+    font-size: 13px;
 }
 
-.status {
+.health-badge {
 
-    display: inline-block;
+    display: inline-flex;
 
-    margin-top: 11px;
+    align-items: center;
 
-    padding: 5px 11px;
+    gap: 6px;
 
-    border-radius: 15px;
+    margin-top: 12px;
+
+    padding: 6px 12px;
+
+    border-radius: 20px;
 
     background: #064e3b;
 
@@ -586,18 +811,31 @@ body {
 
     font-size: 12px;
 
-    font-weight: bold;
+    font-weight: 700;
 }
 
-.grid {
+.health-dot {
+
+    width: 6px;
+
+    height: 6px;
+
+    background: #34d399;
+
+    border-radius: 50%;
+}
+
+
+/* =========================================================
+   STATUS CARDS
+   ========================================================= */
+
+.status-grid {
 
     display: grid;
 
     grid-template-columns:
-        repeat(
-            auto-fit,
-            minmax(190px, 1fr)
-        );
+        repeat(4, 1fr);
 
     gap: 12px;
 
@@ -608,90 +846,173 @@ body {
 
     background: #111827;
 
-    border: 1px solid #334155;
+    border: 1px solid #293548;
 
     border-radius: 9px;
 
-    padding: 14px;
+    padding: 14px 15px;
+
+    min-height: 74px;
 }
 
-.card-title {
+.card-label {
 
-    color: #94a3b8;
+    color: #8492a6;
 
     font-size: 11px;
 
-    margin-bottom: 6px;
-
     text-transform: uppercase;
+
+    margin-bottom: 7px;
 }
 
-.value {
+.card-value {
 
-    font-size: 19px;
+    color: #f1f5f9;
 
-    font-weight: bold;
+    font-size: 20px;
+
+    font-weight: 750;
 }
 
 .healthy {
 
-    color: #6ee7b7;
+    color: #5ee7b7 !important;
 }
+
+.warning {
+
+    color: #fbbf24 !important;
+}
+
+.offline {
+
+    color: #e5e7eb !important;
+}
+
+
+/* =========================================================
+   METRIC CARDS
+   ========================================================= */
+
+.metric-grid {
+
+    display: grid;
+
+    grid-template-columns:
+        repeat(4, 1fr);
+
+    gap: 12px;
+
+    margin-bottom: 14px;
+}
+
+.metric-card {
+
+    background: #111827;
+
+    border: 1px solid #293548;
+
+    border-radius: 9px;
+
+    padding: 14px 15px;
+
+    min-height: 74px;
+}
+
+.metric-title {
+
+    color: #8492a6;
+
+    font-size: 11px;
+
+    text-transform: uppercase;
+
+    margin-bottom: 7px;
+}
+
+.metric-value {
+
+    color: #f1f5f9;
+
+    font-size: 20px;
+
+    font-weight: 750;
+}
+
+
+/* =========================================================
+   CHART GRID
+   ========================================================= */
 
 .chart-grid {
 
     display: grid;
 
     grid-template-columns:
-        repeat(
-            auto-fit,
-            minmax(320px, 1fr)
-        );
+        repeat(2, 1fr);
 
     gap: 12px;
-
-    margin-top: 3px;
 }
 
 .chart-card {
 
     background: #111827;
 
-    border: 1px solid #334155;
+    border: 1px solid #293548;
 
     border-radius: 9px;
 
-    padding: 14px;
+    padding: 14px 15px;
+
+    min-width: 0;
 }
 
 .chart-title {
 
-    color: #94a3b8;
+    color: #8492a6;
 
     font-size: 11px;
 
     text-transform: uppercase;
 
-    margin-bottom: 8px;
+    margin-bottom: 10px;
 }
 
-.chart {
+.graph-container {
 
-    height: 220px;
+    position: relative;
+
+    width: 100%;
+
+    height: 230px;
+
+    min-height: 230px;
 
     background: #020617;
 
-    border-radius: 7px;
+    border: 1px solid #111827;
+
+    border-radius: 8px;
 
     padding: 8px;
+
+    overflow: hidden;
 }
 
-canvas {
+.graph-container canvas {
+
+    display: block;
 
     width: 100% !important;
 
     height: 100% !important;
 }
+
+
+/* =========================================================
+   FOOTER
+   ========================================================= */
 
 .footer {
 
@@ -699,9 +1020,48 @@ canvas {
 
     color: #64748b;
 
-    margin-top: 16px;
+    font-size: 11px;
 
-    font-size: 10px;
+    padding: 14px 0 4px;
+}
+
+
+/* =========================================================
+   RESPONSIVE
+   ========================================================= */
+
+@media (max-width: 900px) {
+
+    .status-grid,
+    .metric-grid {
+
+        grid-template-columns:
+            repeat(2, 1fr);
+    }
+
+    .chart-grid {
+
+        grid-template-columns: 1fr;
+    }
+}
+
+@media (max-width: 550px) {
+
+    .container {
+
+        padding: 15px 10px;
+    }
+
+    .status-grid,
+    .metric-grid {
+
+        grid-template-columns: 1fr;
+    }
+
+    .header h1 {
+
+        font-size: 20px;
+    }
 }
 
 </style>
@@ -711,276 +1071,293 @@ canvas {
 
 <body>
 
-
 <div class="container">
 
 
+<!-- ======================================================
+     HEADER
+======================================================= -->
+
 <div class="header">
 
-<h1>
-SECURITY HARDENED K8S PLATFORM
-</h1>
+    <h1>
+        SECURITY HARDENED K8S PLATFORM
+    </h1>
 
-<p>
-DevOps & Cloud Engineer Security Hardened Kubernetes Platform
-</p>
+    <div class="subtitle">
+        DevOps & Cloud Engineer | Kubernetes Security & Monitoring
+    </div>
 
-<div class="status">
-● Healthy
-</div>
+    <div class="health-badge">
 
-</div>
+        <span class="health-dot"></span>
 
+        <span id="overall-status">
+            Healthy
+        </span>
 
-<!-- STATUS CARDS -->
-
-<div class="grid">
-
-
-<div class="card">
-
-<div class="card-title">
-API
-</div>
-
-<div
-    class="value healthy"
-    id="api">
-Healthy
-</div>
+    </div>
 
 </div>
 
 
-<div class="card">
+<!-- ======================================================
+     STATUS CARDS
+======================================================= -->
 
-<div class="card-title">
-Security
-</div>
+<div class="status-grid">
 
-<div class="value healthy">
-Protected
-</div>
+    <div class="card">
 
-</div>
+        <div class="card-label">
+            API
+        </div>
 
+        <div
+            id="api-status"
+            class="card-value healthy"
+        >
+            Healthy
+        </div>
 
-<div class="card">
-
-<div class="card-title">
-Monitoring
-</div>
-
-<div
-    class="value"
-    id="monitoring">
-Checking...
-</div>
-
-</div>
+    </div>
 
 
-<div class="card">
+    <div class="card">
 
-<div class="card-title">
-Namespace
-</div>
+        <div class="card-label">
+            Security
+        </div>
 
-<div class="value">
-hardened-app
-</div>
+        <div
+            id="security-status"
+            class="card-value healthy"
+        >
+            Protected
+        </div>
 
-</div>
-
-
-</div>
-
-
-<!-- KUBERNETES -->
-
-<div class="grid">
+    </div>
 
 
-<div class="card">
+    <div class="card">
 
-<div class="card-title">
-Pods
-</div>
+        <div class="card-label">
+            Monitoring
+        </div>
 
-<div
-    class="value"
-    id="pods">
-0 / 0
-</div>
+        <div
+            id="monitoring-status"
+            class="card-value"
+        >
+            Loading
+        </div>
 
-</div>
-
-
-<div class="card">
-
-<div class="card-title">
-Nodes
-</div>
-
-<div
-    class="value"
-    id="nodes">
-0 / 0
-</div>
-
-</div>
+    </div>
 
 
-<div class="card">
+    <div class="card">
 
-<div class="card-title">
-Prometheus
-</div>
+        <div class="card-label">
+            Namespace
+        </div>
 
-<div
-    class="value"
-    id="prometheus">
-Checking...
-</div>
+        <div
+            id="namespace"
+            class="card-value"
+        >
+            hardened-app
+        </div>
 
-</div>
-
-
-<div class="card">
-
-<div class="card-title">
-Grafana
-</div>
-
-<div
-    class="value"
-    id="grafana">
-Checking...
-</div>
-
-</div>
+    </div>
 
 
-</div>
+    <div class="card">
+
+        <div class="card-label">
+            Pods
+        </div>
+
+        <div
+            id="pods"
+            class="card-value"
+        >
+            0 / 0
+        </div>
+
+    </div>
 
 
-<!-- RESOURCE USAGE -->
+    <div class="card">
 
-<div class="grid">
+        <div class="card-label">
+            Nodes
+        </div>
 
+        <div
+            id="nodes"
+            class="card-value"
+        >
+            0 / 0
+        </div>
 
-<div class="card">
-
-<div class="card-title">
-CPU Usage
-</div>
-
-<div
-    class="value"
-    id="cpu">
-0%
-</div>
-
-</div>
+    </div>
 
 
-<div class="card">
+    <div class="card">
 
-<div class="card-title">
-Memory Usage
-</div>
+        <div class="card-label">
+            Prometheus
+        </div>
 
-<div
-    class="value"
-    id="memory">
-0%
-</div>
+        <div
+            id="prometheus"
+            class="card-value"
+        >
+            Loading
+        </div>
+
+    </div>
+
+
+    <div class="card">
+
+        <div class="card-label">
+            Grafana
+        </div>
+
+        <div
+            id="grafana"
+            class="card-value"
+        >
+            Loading
+        </div>
+
+    </div>
 
 </div>
 
 
-<div class="card">
+<!-- ======================================================
+     METRIC CARDS
+======================================================= -->
 
-<div class="card-title">
-Platform
+<div class="metric-grid">
+
+
+    <div class="metric-card">
+
+        <div class="metric-title">
+            CPU Usage
+        </div>
+
+        <div
+            id="cpu-value"
+            class="metric-value"
+        >
+            0%
+        </div>
+
+    </div>
+
+
+    <div class="metric-card">
+
+        <div class="metric-title">
+            Memory Usage
+        </div>
+
+        <div
+            id="memory-value"
+            class="metric-value"
+        >
+            0%
+        </div>
+
+    </div>
+
+
+    <div class="metric-card">
+
+        <div class="metric-title">
+            Platform
+        </div>
+
+        <div class="metric-value">
+            Kubernetes
+        </div>
+
+    </div>
+
+
+    <div class="metric-card">
+
+        <div class="metric-title">
+            Security
+        </div>
+
+        <div class="metric-value healthy">
+            RBAC + NetworkPolicy
+        </div>
+
+    </div>
+
 </div>
 
-<div class="value">
-Kubernetes
-</div>
 
-</div>
-
-
-<div class="card">
-
-<div class="card-title">
-Security
-</div>
-
-<div class="value healthy">
-RBAC + NetworkPolicy
-</div>
-
-</div>
-
-
-</div>
-
-
-<!-- SEPARATE CPU AND MEMORY CHARTS -->
+<!-- ======================================================
+     CHARTS
+======================================================= -->
 
 <div class="chart-grid">
 
 
-<!-- CPU CHART -->
+    <!-- CPU -->
 
-<div class="chart-card">
+    <div class="chart-card">
 
-<div class="chart-title">
-CPU Utilization
-</div>
+        <div class="chart-title">
+            CPU UTILIZATION
+        </div>
 
-<div class="chart">
+        <div class="graph-container">
 
-<canvas id="cpuChart"></canvas>
+            <canvas id="cpuChart"></canvas>
 
-</div>
+        </div>
 
-</div>
+    </div>
 
 
-<!-- MEMORY CHART -->
+    <!-- MEMORY -->
 
-<div class="chart-card">
+    <div class="chart-card">
 
-<div class="chart-title">
-Memory Utilization
-</div>
+        <div class="chart-title">
+            MEMORY UTILIZATION
+        </div>
 
-<div class="chart">
+        <div class="graph-container">
 
-<canvas id="memoryChart"></canvas>
+            <canvas id="memoryChart"></canvas>
 
-</div>
+        </div>
 
-</div>
-
+    </div>
 
 </div>
 
 
 <div class="footer">
 
-Security Hardened Kubernetes Platform
-|
-Prometheus
-|
-Grafana
-|
-RBAC
-|
-NetworkPolicy
+    Security Hardened Kubernetes Platform
+    |
+    Prometheus
+    |
+    Grafana
+    |
+    RBAC
+    |
+    NetworkPolicy
 
 </div>
 
@@ -990,187 +1367,358 @@ NetworkPolicy
 
 <script>
 
-
-/* =========================================================
-   MONITORING HISTORY
-   ========================================================= */
+/* ==========================================================
+   GRAPH DATA
+========================================================== */
 
 const cpuData = [];
 
 const memoryData = [];
 
-const maxPoints = 20;
+const MAX_POINTS = 30;
 
 
-/* =========================================================
-   GENERIC GRAPH GRID
-   ========================================================= */
+/* ==========================================================
+   CANVAS PREPARATION
+========================================================== */
 
-function drawGraphGrid(
-    ctx,
-    w,
-    h
+function prepareCanvas(canvas) {
+
+    const parent =
+        canvas.parentElement;
+
+    const rect =
+        parent.getBoundingClientRect();
+
+    const width =
+        Math.max(
+            Math.floor(
+                rect.width - 16
+            ),
+            280
+        );
+
+    const height =
+        Math.max(
+            Math.floor(
+                rect.height - 16
+            ),
+            180
+        );
+
+    const dpr =
+        window.devicePixelRatio || 1;
+
+    canvas.width =
+        Math.floor(
+            width * dpr
+        );
+
+    canvas.height =
+        Math.floor(
+            height * dpr
+        );
+
+    canvas.style.width =
+        width + "px";
+
+    canvas.style.height =
+        height + "px";
+
+    const ctx =
+        canvas.getContext("2d");
+
+    ctx.setTransform(
+        dpr,
+        0,
+        0,
+        dpr,
+        0,
+        0
+    );
+
+    return {
+        ctx,
+        width,
+        height
+    };
+}
+
+
+/* ==========================================================
+   DRAW GRAPH
+========================================================== */
+
+function drawGraph(
+    canvasId,
+    data,
+    lineColor
 ) {
 
-    ctx.strokeStyle =
-        "#334155";
+    const canvas =
+        document.getElementById(
+            canvasId
+        );
 
-    ctx.lineWidth = 1;
+    if (!canvas) {
+
+        return;
+    }
+
+    const {
+        ctx,
+        width,
+        height
+    } = prepareCanvas(canvas);
 
 
-    for (
-        let i = 0;
-        i <= 4;
-        i++
-    ) {
+    /* Background */
 
-        const y =
-            15 +
-            (
-                (h - 30)
-                *
-                i
-                /
-                4
+    ctx.fillStyle =
+        "#020617";
+
+    ctx.fillRect(
+        0,
+        0,
+        width,
+        height
+    );
+
+
+    /* Graph padding */
+
+    const left = 34;
+
+    const right = 10;
+
+    const top = 15;
+
+    const bottom = 15;
+
+    const graphWidth =
+        width -
+        left -
+        right;
+
+    const graphHeight =
+        height -
+        top -
+        bottom;
+
+
+    /* ======================================================
+       HORIZONTAL GRID
+    ====================================================== */
+
+    const levels = [
+        100,
+        75,
+        50,
+        25,
+        0
+    ];
+
+    ctx.font =
+        "11px Arial";
+
+    levels.forEach(
+        level => {
+
+            const y =
+                top +
+                (
+                    (100 - level)
+                    / 100
+                ) *
+                graphHeight;
+
+            ctx.beginPath();
+
+            ctx.moveTo(
+                left,
+                y
             );
 
+            ctx.lineTo(
+                width - right,
+                y
+            );
+
+            ctx.strokeStyle =
+                "#253044";
+
+            ctx.lineWidth = 1;
+
+            ctx.stroke();
+
+            ctx.fillStyle =
+                "#64748b";
+
+            ctx.textAlign =
+                "right";
+
+            ctx.textBaseline =
+                "middle";
+
+            ctx.fillText(
+                level + "%",
+                left - 5,
+                y
+            );
+
+        }
+    );
+
+
+    /* ======================================================
+       NO DATA
+    ====================================================== */
+
+    if (
+        !data ||
+        data.length === 0
+    ) {
+
+        ctx.fillStyle =
+            "#64748b";
+
+        ctx.font =
+            "12px Arial";
+
+        ctx.textAlign =
+            "center";
+
+        ctx.textBaseline =
+            "middle";
+
+        ctx.fillText(
+            "Waiting for monitoring data...",
+            width / 2,
+            height / 2
+        );
+
+        return;
+    }
+
+
+    /* ======================================================
+       CALCULATE POINTS
+    ====================================================== */
+
+    const points =
+        data.map(
+            (value, index) => {
+
+                const x =
+                    data.length === 1
+                        ? left +
+                          graphWidth / 2
+                        : left +
+                          (
+                              index /
+                              (
+                                  data.length -
+                                  1
+                              )
+                          ) *
+                          graphWidth;
+
+                const safeValue =
+                    Math.max(
+                        0,
+                        Math.min(
+                            100,
+                            Number(value) || 0
+                        )
+                    );
+
+                const y =
+                    top +
+                    (
+                        (100 - safeValue)
+                        / 100
+                    ) *
+                    graphHeight;
+
+                return {
+                    x,
+                    y,
+                    value:
+                        safeValue
+                };
+
+            }
+        );
+
+
+    /* ======================================================
+       AREA
+    ====================================================== */
+
+    if (
+        points.length >= 2
+    ) {
 
         ctx.beginPath();
 
         ctx.moveTo(
-            30,
-            y
+            points[0].x,
+            height - bottom
+        );
+
+        points.forEach(
+            point => {
+
+                ctx.lineTo(
+                    point.x,
+                    point.y
+                );
+
+            }
         );
 
         ctx.lineTo(
-            w - 10,
-            y
+            points[
+                points.length - 1
+            ].x,
+            height - bottom
         );
 
-        ctx.stroke();
+        ctx.closePath();
+
+        ctx.fillStyle =
+            lineColor === "cpu"
+                ? "rgba(34,197,94,0.10)"
+                : "rgba(167,139,250,0.10)";
+
+        ctx.fill();
 
     }
 
 
-    /* LABELS */
-
-    ctx.fillStyle =
-        "#64748b";
-
-    ctx.font =
-        "10px Arial";
-
-
-    ctx.fillText(
-        "100%",
-        2,
-        18
-    );
-
-    ctx.fillText(
-        "75%",
-        7,
-        h / 4 + 2
-    );
-
-    ctx.fillText(
-        "50%",
-        7,
-        h / 2 + 2
-    );
-
-    ctx.fillText(
-        "25%",
-        7,
-        (h * 3 / 4) + 2
-    );
-
-    ctx.fillText(
-        "0%",
-        12,
-        h - 8
-    );
-
-}
-
-
-/* =========================================================
-   DRAW SINGLE GRAPH LINE
-   ========================================================= */
-
-function drawDataLine(
-    ctx,
-    data,
-    w,
-    h,
-    lineColor
-) {
-
-    if (
-        data.length < 2
-    ) {
-
-        return;
-
-    }
-
+    /* ======================================================
+       ZIG-ZAG LINE
+    ====================================================== */
 
     ctx.beginPath();
 
-
-    data.forEach(
-        (
-            value,
-            index
-        ) => {
-
-            const x =
-                30 +
-                (
-                    (w - 40)
-                    *
-                    index
-                    /
-                    (maxPoints - 1)
-                );
-
-
-            const safeValue =
-                Math.max(
-                    0,
-                    Math.min(
-                        100,
-                        value
-                    )
-                );
-
-
-            const y =
-                h -
-                15 -
-                (
-                    (h - 30)
-                    *
-                    safeValue
-                    /
-                    100
-                );
-
+    points.forEach(
+        (point, index) => {
 
             if (
                 index === 0
             ) {
 
                 ctx.moveTo(
-                    x,
-                    y
+                    point.x,
+                    point.y
                 );
 
             } else {
 
                 ctx.lineTo(
-                    x,
-                    y
+                    point.x,
+                    point.y
                 );
 
             }
@@ -1178,244 +1726,136 @@ function drawDataLine(
         }
     );
 
-
-    ctx.lineWidth = 2;
-
     ctx.strokeStyle =
-        lineColor;
+        lineColor === "cpu"
+            ? "#22c55e"
+            : "#a78bfa";
+
+    ctx.lineWidth = 3;
+
+    ctx.lineJoin =
+        "miter";
+
+    ctx.lineCap =
+        "round";
 
     ctx.stroke();
 
-}
 
+    /* ======================================================
+       DATA POINTS
+    ====================================================== */
 
-/* =========================================================
-   CPU GRAPH
-   ========================================================= */
+    points.forEach(
+        point => {
 
-function drawCPUChart() {
+            ctx.beginPath();
 
-    const canvas =
-        document.getElementById(
-            "cpuChart"
-        );
-
-    if (!canvas) {
-
-        return;
-
-    }
-
-
-    const ctx =
-        canvas.getContext("2d");
-
-    const w =
-        canvas.clientWidth;
-
-    const h =
-        canvas.clientHeight;
-
-
-    if (
-        w <= 0 ||
-        h <= 0
-    ) {
-
-        return;
-
-    }
-
-
-    canvas.width =
-        w * 2;
-
-    canvas.height =
-        h * 2;
-
-
-    ctx.setTransform(
-        2,
-        0,
-        0,
-        2,
-        0,
-        0
-    );
-
-
-    ctx.clearRect(
-        0,
-        0,
-        w,
-        h
-    );
-
-
-    drawGraphGrid(
-        ctx,
-        w,
-        h
-    );
-
-
-    drawDataLine(
-        ctx,
-        cpuData,
-        w,
-        h,
-        "#38bdf8"
-    );
-
-}
-
-
-/* =========================================================
-   MEMORY GRAPH
-   ========================================================= */
-
-function drawMemoryChart() {
-
-    const canvas =
-        document.getElementById(
-            "memoryChart"
-        );
-
-    if (!canvas) {
-
-        return;
-
-    }
-
-
-    const ctx =
-        canvas.getContext("2d");
-
-    const w =
-        canvas.clientWidth;
-
-    const h =
-        canvas.clientHeight;
-
-
-    if (
-        w <= 0 ||
-        h <= 0
-    ) {
-
-        return;
-
-    }
-
-
-    canvas.width =
-        w * 2;
-
-    canvas.height =
-        h * 2;
-
-
-    ctx.setTransform(
-        2,
-        0,
-        0,
-        2,
-        0,
-        0
-    );
-
-
-    ctx.clearRect(
-        0,
-        0,
-        w,
-        h
-    );
-
-
-    drawGraphGrid(
-        ctx,
-        w,
-        h
-    );
-
-
-    drawDataLine(
-        ctx,
-        memoryData,
-        w,
-        h,
-        "#a78bfa"
-    );
-
-}
-
-
-/* =========================================================
-   REFRESH DATA
-   ========================================================= */
-
-async function refreshData() {
-
-
-    /* =========================
-       API HEALTH
-       ========================= */
-
-    try {
-
-        const healthResponse =
-            await fetch(
-                "/health",
-                {
-                    cache: "no-store"
-                }
+            ctx.arc(
+                point.x,
+                point.y,
+                2.5,
+                0,
+                Math.PI * 2
             );
 
+            ctx.fillStyle =
+                lineColor === "cpu"
+                    ? "#22c55e"
+                    : "#a78bfa";
 
-        if (
-            healthResponse.ok
-        ) {
-
-            const healthData =
-                await healthResponse.json();
-
-
-            document.getElementById(
-                "api"
-            ).textContent =
-                healthData.status === "healthy"
-                ? "Healthy"
-                : "Error";
-
-        } else {
-
-            document.getElementById(
-                "api"
-            ).textContent =
-                "Error";
+            ctx.fill();
 
         }
+    );
 
-    } catch (error) {
 
-        console.error(
-            "API health error:",
-            error
+    /* ======================================================
+       CURRENT POINT
+    ====================================================== */
+
+    const latest =
+        points[
+            points.length - 1
+        ];
+
+    ctx.beginPath();
+
+    ctx.arc(
+        latest.x,
+        latest.y,
+        4,
+        0,
+        Math.PI * 2
+    );
+
+    ctx.fillStyle =
+        lineColor === "cpu"
+            ? "#22c55e"
+            : "#a78bfa";
+
+    ctx.fill();
+
+}
+
+
+/* ==========================================================
+   STATUS COLOR ONLY
+========================================================== */
+
+function setStatusColor(
+    elementId,
+    value
+) {
+
+    const element =
+        document.getElementById(
+            elementId
         );
 
+    if (!element) {
 
-        document.getElementById(
-            "api"
-        ).textContent =
-            "Error";
+        return;
+    }
+
+    element.classList.remove(
+        "healthy",
+        "warning",
+        "offline"
+    );
+
+    if (
+        value === "Healthy"
+    ) {
+
+        element.classList.add(
+            "healthy"
+        );
+
+    } else if (
+        value === "Warning"
+    ) {
+
+        element.classList.add(
+            "warning"
+        );
+
+    } else {
+
+        element.classList.add(
+            "offline"
+        );
 
     }
 
+}
 
-    /* =========================
-       MONITORING DATA
-       ========================= */
+
+/* ==========================================================
+   UPDATE MONITORING
+========================================================== */
+
+async function loadMonitoringData() {
 
     try {
 
@@ -1427,149 +1867,310 @@ async function refreshData() {
                 }
             );
 
-
         if (!response.ok) {
 
             throw new Error(
-                "Monitoring API returned HTTP "
-                + response.status
+                "Monitoring API failed"
             );
-
         }
-
 
         const data =
             await response.json();
 
 
-        /* =========================
+        /* ==================================================
+           NAMESPACE
+        ================================================== */
+
+        document.getElementById(
+            "namespace"
+        ).textContent =
+            data.namespace ||
+            "hardened-app";
+
+
+        /* ==================================================
            PODS
-           ========================= */
+        ================================================== */
+
+        const runningPods =
+            data.pods?.running ?? 0;
+
+        const totalPods =
+            data.pods?.total ?? 0;
 
         document.getElementById(
             "pods"
         ).textContent =
-            data.pods.running
-            + " / "
-            + data.pods.total;
+            `${runningPods} / ${totalPods}`;
+
+        setStatusColor(
+            "pods",
+            data.pods?.status ||
+            "Offline"
+        );
 
 
-        /* =========================
+        /* ==================================================
            NODES
-           ========================= */
+        ================================================== */
+
+        const readyNodes =
+            data.nodes?.ready ?? 0;
+
+        const totalNodes =
+            data.nodes?.total ?? 0;
 
         document.getElementById(
             "nodes"
         ).textContent =
-            data.nodes.ready
-            + " / "
-            + data.nodes.total;
+            `${readyNodes} / ${totalNodes}`;
+
+        setStatusColor(
+            "nodes",
+            data.nodes?.status ||
+            "Offline"
+        );
 
 
-        /* =========================
-           CPU
-           ========================= */
-
-        document.getElementById(
-            "cpu"
-        ).textContent =
-            data.cpu
-            + "%";
-
-
-        /* =========================
-           MEMORY
-           ========================= */
-
-        document.getElementById(
-            "memory"
-        ).textContent =
-            data.memory
-            + "%";
-
-
-        /* =========================
+        /* ==================================================
            PROMETHEUS
-           ========================= */
+        ================================================== */
+
+        const prometheus =
+            data.prometheus ||
+            "Offline";
+
+        setStatusColor(
+            "prometheus",
+            prometheus
+        );
 
         document.getElementById(
             "prometheus"
         ).textContent =
-            data.monitoring.prometheus
-            ? "Healthy"
-            : "Offline";
+            prometheus;
 
 
-        /* =========================
+        /* ==================================================
            GRAFANA
-           ========================= */
+        ================================================== */
+
+        const grafana =
+            data.grafana ||
+            "Offline";
+
+        setStatusColor(
+            "grafana",
+            grafana
+        );
 
         document.getElementById(
             "grafana"
         ).textContent =
-            data.monitoring.grafana
-            ? "Healthy"
-            : "Offline";
+            grafana;
 
 
-        /* =========================
+        /* ==================================================
            MONITORING
-           ========================= */
+        ================================================== */
+
+        const monitoring =
+            data.monitoring ||
+            "Offline";
+
+        setStatusColor(
+            "monitoring-status",
+            monitoring
+        );
 
         document.getElementById(
-            "monitoring"
+            "monitoring-status"
         ).textContent =
-            data.monitoring.active
-            ? "Active"
-            : "Offline";
+            monitoring;
 
 
-        /* =========================
-           CPU HISTORY
-           ========================= */
+        /* ==================================================
+           CPU CURRENT VALUE
+        ================================================== */
 
-        cpuData.push(
-            Number(data.cpu) || 0
+        const cpu =
+            Number(
+                data.cpu
+            ) || 0;
+
+        document.getElementById(
+            "cpu-value"
+        ).textContent =
+            cpu.toFixed(2)
+            + "%";
+
+
+        /* ==================================================
+           CPU HISTORICAL DATA
+        ================================================== */
+
+        const cpuHistory =
+            Array.isArray(
+                data.cpu_history
+            )
+                ? data.cpu_history
+                : [];
+
+        cpuData.length = 0;
+
+        cpuHistory.forEach(
+            value => {
+
+                const number =
+                    Number(value);
+
+                if (
+                    Number.isFinite(
+                        number
+                    )
+                ) {
+
+                    cpuData.push(
+                        Math.max(
+                            0,
+                            Math.min(
+                                100,
+                                number
+                            )
+                        )
+                    );
+
+                }
+
+            }
         );
 
 
         if (
-            cpuData.length
-            > maxPoints
+            cpuData.length >
+            MAX_POINTS
         ) {
 
-            cpuData.shift();
+            cpuData.splice(
+                0,
+                cpuData.length -
+                MAX_POINTS
+            );
 
         }
 
 
-        /* =========================
-           MEMORY HISTORY
-           ========================= */
+        drawGraph(
+            "cpuChart",
+            cpuData,
+            "cpu"
+        );
 
-        memoryData.push(
-            Number(data.memory) || 0
+
+        /* ==================================================
+           MEMORY CURRENT VALUE
+        ================================================== */
+
+        const memory =
+            Number(
+                data.memory
+            ) || 0;
+
+        document.getElementById(
+            "memory-value"
+        ).textContent =
+            memory.toFixed(2)
+            + "%";
+
+
+        /* ==================================================
+           MEMORY HISTORICAL DATA
+        ================================================== */
+
+        const memoryHistory =
+            Array.isArray(
+                data.memory_history
+            )
+                ? data.memory_history
+                : [];
+
+        memoryData.length = 0;
+
+        memoryHistory.forEach(
+            value => {
+
+                const number =
+                    Number(value);
+
+                if (
+                    Number.isFinite(
+                        number
+                    )
+                ) {
+
+                    memoryData.push(
+                        Math.max(
+                            0,
+                            Math.min(
+                                100,
+                                number
+                            )
+                        )
+                    );
+
+                }
+
+            }
         );
 
 
         if (
-            memoryData.length
-            > maxPoints
+            memoryData.length >
+            MAX_POINTS
         ) {
 
-            memoryData.shift();
+            memoryData.splice(
+                0,
+                memoryData.length -
+                MAX_POINTS
+            );
 
         }
 
 
-        /* =========================
-           DRAW SEPARATE GRAPHS
-           ========================= */
+        drawGraph(
+            "memoryChart",
+            memoryData,
+            "memory"
+        );
 
-        drawCPUChart();
 
-        drawMemoryChart();
+        /* ==================================================
+           OVERALL STATUS
+        ================================================== */
 
+        if (
+            data.prometheus ===
+                "Healthy"
+            &&
+            data.grafana ===
+                "Healthy"
+        ) {
+
+            document.getElementById(
+                "overall-status"
+            ).textContent =
+                "Healthy";
+
+        } else {
+
+            document.getElementById(
+                "overall-status"
+            ).textContent =
+                "Monitoring Warning";
+
+        }
 
     } catch (error) {
 
@@ -1578,130 +2179,99 @@ async function refreshData() {
             error
         );
 
+        setStatusColor(
+            "monitoring-status",
+            "Offline"
+        );
 
-        /*
-         * IMPORTANT:
-         * Monitoring failure must NOT
-         * change the API card to Error.
-         */
+        setStatusColor(
+            "prometheus",
+            "Offline"
+        );
 
-        document.getElementById(
-            "monitoring"
-        ).textContent =
-            "Offline";
-
-
-        document.getElementById(
-            "prometheus"
-        ).textContent =
-            "Offline";
-
-
-        document.getElementById(
-            "grafana"
-        ).textContent =
-            "Offline";
+        setStatusColor(
+            "grafana",
+            "Offline"
+        );
 
     }
 
 }
 
 
-/* =========================================================
-   INITIAL LOAD
-   ========================================================= */
+/* ==========================================================
+   INITIAL GRAPH
+========================================================== */
 
-refreshData();
+drawGraph(
+    "cpuChart",
+    [],
+    "cpu"
+);
+
+drawGraph(
+    "memoryChart",
+    [],
+    "memory"
+);
 
 
-/* =========================================================
-   AUTO REFRESH
-   ========================================================= */
+/* ==========================================================
+   FIRST LOAD
+========================================================== */
+
+loadMonitoringData();
+
+
+/* ==========================================================
+   LIVE UPDATE
+========================================================== */
 
 setInterval(
-    refreshData,
+    loadMonitoringData,
     10000
 );
 
 
-/* =========================================================
-   RESPONSIVE GRAPHS
-   ========================================================= */
+/* ==========================================================
+   RESPONSIVE GRAPH
+========================================================== */
 
 window.addEventListener(
     "resize",
-    function () {
+    function() {
 
-        drawCPUChart();
+        drawGraph(
+            "cpuChart",
+            cpuData,
+            "cpu"
+        );
 
-        drawMemoryChart();
+        drawGraph(
+            "memoryChart",
+            memoryData,
+            "memory"
+        );
 
     }
 );
 
-
 </script>
-
 
 </body>
 
 </html>
-'''
-    )
+""")
 
 
-# =========================================================
-# APPLICATION READY API
-# =========================================================
-
-@app.route("/ready")
-def ready():
-
-    return jsonify({
-
-        "status": "ready",
-
-        "service":
-            "security-hardened-k8s-platform"
-
-    })
-
-
-# =========================================================
+# ============================================================
 # APPLICATION START
-# =========================================================
+# ============================================================
 
 if __name__ == "__main__":
 
-    print(
-        "Starting Security Hardened Kubernetes Platform..."
-    )
-
-    print(
-        "Namespace:",
-        NAMESPACE
-    )
-
-    print(
-        "Kubernetes API:",
-        KUBERNETES_API
-    )
-
-    print(
-        "ServiceAccount token:",
-        bool(
-            get_kubernetes_token()
-        )
-    )
-
-    print(
-        "ServiceAccount CA:",
-        bool(
-            get_kubernetes_ssl_context()
-        )
-    )
-
     app.run(
         host="0.0.0.0",
-        port=5000
+        port=5000,
+        debug=False
     )

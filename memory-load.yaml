@@ -1,1 +1,43 @@
-kubectl top nodes
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: memory-load
+  namespace: hardened-app
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: memory-load
+  template:
+    metadata:
+      labels:
+        app: memory-load
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        seccompProfile:
+          type: RuntimeDefault
+
+      containers:
+        - name: memory-load
+          image: python:3.12-alpine
+          command:
+            - python
+            - -c
+            - |
+              chunks = []
+              while True:
+                  chunks.append(bytearray(100 * 1024 * 1024))
+
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+
+          resources:
+            requests:
+              memory: "100Mi"
+            limits:
+              memory: "700Mi"
