@@ -18,7 +18,6 @@ spec:
         runAsUser: 65534
         seccompProfile:
           type: RuntimeDefault
-
       containers:
         - name: memory-load
           image: python:3.12-alpine
@@ -26,18 +25,19 @@ spec:
             - python
             - -c
             - |
+              import time
               chunks = []
-              while True:
+              for i in range(5):
                   chunks.append(bytearray(100 * 1024 * 1024))
-
+              while True:
+                  time.sleep(10)
           securityContext:
             allowPrivilegeEscalation: false
             capabilities:
               drop:
                 - ALL
-
           resources:
             requests:
-              memory: "100Mi"
+              memory: "550Mi"
             limits:
               memory: "700Mi"

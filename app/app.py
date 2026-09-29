@@ -482,19 +482,25 @@ def get_cpu_history():
 def get_memory_usage():
 
     query = """
-    100 * (
-        1 -
-        (
-            sum(node_memory_MemAvailable_bytes)
-            /
-            sum(node_memory_MemTotal_bytes)
+    100 *
+    (
+        sum(
+            container_memory_working_set_bytes{
+                container!="",
+                image!=""
+            }
+        )
+        /
+        sum(
+            kube_node_status_allocatable{
+                resource="memory",
+                unit="byte"
+            }
         )
     )
     """
 
-    value = prometheus_query(
-        query
-    )
+    value = prometheus_query(query)
 
     return round(
         max(
@@ -507,20 +513,23 @@ def get_memory_usage():
         2
     )
 
-
-# ============================================================
-# MEMORY HISTORICAL DATA
-# ============================================================
-
 def get_memory_history():
 
     query = """
-    100 * (
-        1 -
-        (
-            sum(node_memory_MemAvailable_bytes)
-            /
-            sum(node_memory_MemTotal_bytes)
+    100 *
+    (
+        sum(
+            container_memory_working_set_bytes{
+                container!="",
+                image!=""
+            }
+        )
+        /
+        sum(
+            kube_node_status_allocatable{
+                resource="memory",
+                unit="byte"
+            }
         )
     )
     """
